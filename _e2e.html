@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Wharparilla E2E</title></head>
+<body>
+<pre id="out"></pre>
+<script src="wparBlocks.js"></script>
+<script src="wparContacts.js"></script>
+<script>
+(async function(){
+  const out = document.getElementById('out');
+  const log = (...a)=>{ out.textContent += a.join(' ') + '\n'; };
+
+  let failures = 0;
+  function assert(name, cond, extra){
+    if(cond){ log('PASS  ' + name); }
+    else { failures++; log('FAIL  ' + name + (extra?' — '+extra:'')); }
+  }
+
+  // Fresh state for each run.
+  localStorage.removeItem('wparBlocks');
+  localStorage.removeItem('wparContacts');
+
+  const WB = window.wparBlocks;
+  const WC = window.wparContacts;
+
+  // Re-seed contacts manually since the module seeds on load, not reload.
+  // Easiest: trigger a page reload by re-invoking the module's seed. We can't
+  // reload the page from inside the script, so we hand-seed instead:
+  WC.add({ name: 'Harry Thompson', phone: '0412 334 998', email: 'harry.thompson@gmail.com' });
+  WC.add({ name: 'Olivia Pearce',  phone: '0423 118 445', email: 'olivia.p@outlook.com' });
+  WC.add({ name: 'Daniel Rossi',   phone: '0421 998 006', email: 'drossi@bigpond.com' });
+
+  // ───────────────────────────────────────────────────────────────
+  log('── Scenario A: agent places direct hold via contact search ──');
+  const blockA = '8-32';
+
+  // Agent searches contacts
+  const results = WC.search('harry');
+  assert('A1 search for "harry" returns Harry Thompson',
+    results.some(c => c.name === 'Harry Thompson'),
+    'results=' + JSON.stringify(results.map(c=>c.name)));
+
+  const harry = results.find(c => c.name === 'Harry Thompson');
+
+  // Agent places direct hold on block 8-32 with Harry as purchaser
+  WB.placeDirectHold(blockA, {
+    purchasers: [{ name: harry.name, phone: harry.phone, email: harry.email }],
+    contactId: harry.id,
+    notes: 'Hold until Fri — buyer has deposit ready',
+    placedBy: 'agent-1',
+  });
+
+  const recA = WB.getBlock(blockA);
+  assert('A2 block A status is on_hold', recA.status === WB.STATUS.ON_HOLD, recA.status);
+  assert('A3 hold has intentionForm with token', !!recA.hold.intentionForm?.token);
+  assert('A4 hold has sentAt timestamp',       !!recA.hold.intentionForm?.sentAt);
+  assert('A5 hold is NOT yet signed',          !recA.hold.intentionForm.signedAt);
+  assert('A6 hold.contactId is Harry\'s id',   recA.hold.contactId === harry.id);
+  assert('A7 purchaser name is Harry',         recA.hold.purchasers[0].name === 'Harry Thompson');
+  assert('A8 notes preserved',                 recA.hold.notes === 'Hold until Fri — buyer has deposit ready');
+
+  const tokenA = recA.hold.intentionForm.token;
+
+  // Buyer "visits" the intention form via findByFormToken
+  const findA = WB.findByFormToken(tokenA);
+  assert('A9 findByFormToken returns the block',
+    findA && findA.key === blockA,
+    'got key=' + (findA && findA.key));
+
+  // Buyer signs the form
+  const signRes = WB.signIntentionForm(tokenA, {
+    signatureName: 'Harry Thompson',
+    acknowledgements: { 'not-contract': true, 'info-correct': true, 'agent-contact': true },
+  });
+  assert('A10 signIntentionForm returns ok',   signRes.ok === true);
+  const recA2 = WB.getBlock(blockA);
+  assert('A11 signedAt is populated',          !!recA2.hold.intentionForm.signedAt);
+  assert('A12 signatureName stored',           recA2.hold.intentionForm.signatureName === 'Harry Thompson');
+  assert('A13 acknowledgements stored',        recA2.hold.intentionForm.acknowledgements['not-contract'] === true);
+
+  // Signing with bogus token fails
+  const bogus = WB.signIntentionForm('nope', { signatureName: 'x' });
+  assert('A14 signing a bogus token fails',    bogus.ok === false);
+
+  // ───────────────────────────────────────────────────────────────
+  log('── Scenario B: buyer requests hold on available block → agent approves ──');
+  const blockB = '8-33';
+
+  // Buyer requests hold from ebook (block is available)
+  const reqB = WB.requestHold(blockB, {
+    name: 'Sarah Mitchell', phone: '0400 123 456', email: 'sarah.m@example.com', source: 'ebook',
+  });
+  assert('B1 requestHold ok',                  reqB.ok === true);
+  assert('B2 placedTo is pending',             reqB.placedTo === 'pending');
+
+  const recB1 = WB.getBlock(blockB);
+  assert('B3 block B status is on_hold_pending', recB1.status === WB.STATUS.ON_HOLD_PENDING);
+  assert('B4 pendingHolds has 1 entry',          recB1.pendingHolds.length === 1);
+  assert('B5 pending entry has correct name',    recB1.pendingHolds[0].name === 'Sarah Mitchell');
+  assert('B6 pending entry source is ebook',     recB1.pendingHolds[0].source === 'ebook');
+
+  // Second buyer also requests the same block (should queue in pending)
+  WB.requestHold(blockB, { name: 'Tom Lane', phone: '0411 222 333', email: 't@example.com', source: 'ebook' });
+  const recB2 = WB.getBlock(blockB);
+  assert('B7 two pending holds on same block',   recB2.pendingHolds.length === 2);
+  assert('B8 status still on_hold_pending',      recB2.status === WB.STATUS.ON_HOLD_PENDING);
+
+  // Agent finds-or-creates contact for Sarah (she's new)
+  const existing = WC.search('sarah');
+  assert('B9 Sarah is not yet in contacts',      existing.length === 0);
+
+  const sarahContact = WC.add({ name: 'Sarah Mitchell', phone: '0400 123 456', email: 'sarah.m@example.com' });
+  assert('B10 Sarah added to contacts',          !!sarahContact.id);
+
+  // Agent approves Sarah's pending hold
+  const sarahPendingId = recB2.pendingHolds.find(p => p.name === 'Sarah Mitchell').id;
+  WB.approvePending(blockB, sarahPendingId, { contactId: sarahContact.id });
+
+  const recB3 = WB.getBlock(blockB);
+  assert('B11 block B is now on_hold',           recB3.status === WB.STATUS.ON_HOLD);
+  assert('B12 hold.purchasers[0] is Sarah',      recB3.hold.purchasers[0].name === 'Sarah Mitchell');
+  assert('B13 hold.contactId is Sarah\'s id',    recB3.hold.contactId === sarahContact.id);
+  assert('B14 pendingHolds is empty',            recB3.pendingHolds.length === 0);
+  assert('B15 Tom moved to waitlist',            recB3.waitlist.length === 1 && recB3.waitlist[0].name === 'Tom Lane');
+  assert('B16 intention form token generated',   !!recB3.hold.intentionForm?.token);
+  assert('B17 intention form NOT yet signed',    !recB3.hold.intentionForm.signedAt);
+
+  // ───────────────────────────────────────────────────────────────
+  log('── Scenario C: direct hold while block has pending → pending goes to waitlist ──');
+  const blockC = '8-34';
+
+  WB.requestHold(blockC, { name: 'Alice', phone: '04111', email: 'a@e.com', source: 'ebook' });
+  WB.requestHold(blockC, { name: 'Bob',   phone: '04222', email: 'b@e.com', source: 'ebook' });
+  const recC1 = WB.getBlock(blockC);
+  assert('C1 2 pending on block C',              recC1.pendingHolds.length === 2);
+
+  // Agent places direct hold with someone else entirely (phone buyer)
+  const olivia = WC.search('olivia')[0];
+  WB.placeDirectHold(blockC, {
+    purchasers: [{ name: olivia.name, phone: olivia.phone, email: olivia.email }],
+    contactId: olivia.id,
+    notes: '',
+    placedBy: 'agent-1',
+  });
+  const recC2 = WB.getBlock(blockC);
+  assert('C2 block C is on_hold with Olivia',    recC2.status === WB.STATUS.ON_HOLD && recC2.hold.purchasers[0].name === 'Olivia Pearce');
+  assert('C3 both prior pending → waitlist',     recC2.waitlist.length === 2 && recC2.waitlist.some(w=>w.name==='Alice') && recC2.waitlist.some(w=>w.name==='Bob'));
+  assert('C4 pendingHolds cleared',              recC2.pendingHolds.length === 0);
+
+  // ───────────────────────────────────────────────────────────────
+  log('── Scenario D: release hold → block returns to available ──');
+  WB.releaseHold(blockA);
+  const recD1 = WB.getBlock(blockA);
+  assert('D1 after release block A is available', recD1.status === WB.STATUS.AVAILABLE);
+  assert('D2 hold cleared',                       recD1.hold === null);
+
+  // ───────────────────────────────────────────────────────────────
+  log('── Scenario E: waitlist request on held block ──');
+  const reqE = WB.requestHold(blockC, { name: 'Zoe', phone: '04999', email: 'z@e.com', source: 'ebook' });
+  assert('E1 requestHold on held block → waitlist', reqE.placedTo === 'waitlist');
+  const recE1 = WB.getBlock(blockC);
+  assert('E2 Zoe is now 3rd on waitlist',           recE1.waitlist.length === 3);
+
+  // Promote Zoe to pending
+  const zoeId = recE1.waitlist.find(w=>w.name==='Zoe').id;
+  WB.promoteFromWaitlist(blockC, zoeId);
+  const recE2 = WB.getBlock(blockC);
+  assert('E3 Zoe moved to pendingHolds',            recE2.pendingHolds.length === 1 && recE2.pendingHolds[0].name === 'Zoe');
+  assert('E4 Zoe removed from waitlist',            recE2.waitlist.length === 2);
+
+  // ───────────────────────────────────────────────────────────────
+  log('── Scenario F: counts + legend numbers ──');
+  const c = WB.counts();
+  // After scenarios A–E: A released (available), B on_hold, C on_hold, so hold=2
+  assert('F1 counts.hold === 2',                    c.hold === 2, 'got ' + c.hold);
+  assert('F2 counts.pending === 0 (A released)',    c.pending === 0, 'got ' + c.pending);
+
+  // ───────────────────────────────────────────────────────────────
+  log('── Scenario G: full lifecycle — hold → signed → conditional → unconditional → settled ──');
+  const blockG = '8-39';
+  // Agent places a direct hold
+  WB.placeDirectHold(blockG, {
+    purchasers: [{ name: 'Harriet Cole', phone: '0410 111 222', email: 'hc@example.com' }],
+    contactId: null, notes: '', placedBy: 'agent-1',
+  });
+  const g1 = WB.getBlock(blockG);
+  assert('G1 status on_hold (awaiting signature)',  g1.status === WB.STATUS.ON_HOLD);
+  assert('G2 intention form has sentAt',            !!g1.hold.intentionForm.sentAt);
+
+  // Buyer signs → status should auto-progress to HOLD_SIGNED
+  WB.signIntentionForm(g1.hold.intentionForm.token, {
+    signatureName: 'Harriet Cole',
+    acknowledgements: { 'not-contract': true, 'info-correct': true, 'agent-contact': true },
+  });
+  const g2 = WB.getBlock(blockG);
+  assert('G3 status auto-promoted to hold_signed',  g2.status === WB.STATUS.HOLD_SIGNED);
+  assert('G4 signedAt stored',                       !!g2.hold.intentionForm.signedAt);
+
+  // Agent issues contract → goes into Contract Review
+  WB.issueContract(blockG);
+  const g3 = WB.getBlock(blockG);
+  assert('G5 status is contract_review',            g3.status === WB.STATUS.CONTRACT_REVIEW);
+  assert('G6 contract.issuedAt stored',             !!g3.hold.contract.issuedAt);
+
+  // Agent marks conditional (contract signed with conditions)
+  WB.markConditional(blockG);
+  const g3b = WB.getBlock(blockG);
+  assert('G6a status is contract_conditional',      g3b.status === WB.STATUS.UNDER_CONTRACT_CONDITIONAL);
+  assert('G6b contract.conditionalAt stored',       !!g3b.hold.contract.conditionalAt);
+
+  // Agent marks unconditional
+  WB.markUnconditional(blockG);
+  const g4 = WB.getBlock(blockG);
+  assert('G7 status is contract_unconditional',     g4.status === WB.STATUS.UNDER_CONTRACT_UNCONDITIONAL);
+  assert('G8 contract.unconditionalAt stored',      !!g4.hold.contract.unconditionalAt);
+
+  // Agent marks settled
+  WB.markSettled(blockG);
+  const g5 = WB.getBlock(blockG);
+  assert('G9 status is sold',                       g5.status === WB.STATUS.SOLD);
+  assert('G10 contract.settledAt stored',           !!g5.hold.contract.settledAt);
+
+  // Counts
+  const cFinal = WB.counts();
+  assert('G11 counts.sold === 1',                   cFinal.sold === 1, 'got ' + cFinal.sold);
+  assert('G12 counts.contract === 0 (settled)',     cFinal.contract === 0, 'got ' + cFinal.contract);
+  assert('G13 counts.signed === 0',                 cFinal.signed === 0, 'got ' + cFinal.signed);
+  assert('G14 counts.review === 0',                 cFinal.review === 0, 'got ' + cFinal.review);
+
+  // ───────────────────────────────────────────────────────────────
+  log('── Scenario H: resendIntentionForm bumps sentAt ──');
+  const blockH = '8-40';
+  WB.placeDirectHold(blockH, {
+    purchasers: [{ name: 'Reiss Patel', phone: '04001', email: 'rp@e.com' }],
+    contactId: null, notes: '', placedBy: null,
+  });
+  const h1 = WB.getBlock(blockH);
+  const originalSentAt = h1.hold.intentionForm.sentAt;
+  await new Promise(r => setTimeout(r, 10));
+  WB.resendIntentionForm(blockH);
+  const h2 = WB.getBlock(blockH);
+  assert('H1 sentAt updated after resend',          h2.hold.intentionForm.sentAt > originalSentAt);
+  assert('H2 token stays the same',                 h2.hold.intentionForm.token === h1.hold.intentionForm.token);
+
+  // ───────────────────────────────────────────────────────────────
+  log('');
+  log(failures === 0 ? '━━ ALL TESTS PASSED ━━' : '━━ ' + failures + ' TEST(S) FAILED ━━');
+
+  // Expose a marker for the external runner.
+  document.title = failures === 0 ? 'E2E-OK' : 'E2E-FAIL-' + failures;
+})();
+</script>
+</body>
+</html>

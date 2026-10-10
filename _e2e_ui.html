@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Wharparilla E2E UI</title></head>
+<body>
+<pre id="out" style="font:12px monospace;white-space:pre-wrap;padding:12px"></pre>
+<iframe id="f" style="width:100%;height:0;border:0" src="about:blank"></iframe>
+<script src="wparBlocks.js"></script>
+<script src="wparContacts.js"></script>
+<script>
+(async function(){
+  const out = document.getElementById('out');
+  const log = (...a)=>{ out.textContent += a.join(' ') + '\n'; };
+  let failures = 0;
+  function assert(name, cond, extra){
+    if(cond){ log('PASS  ' + name); }
+    else { failures++; log('FAIL  ' + name + (extra?' — '+extra:'')); }
+  }
+
+  // 1) Seed state
+  localStorage.removeItem('wparBlocks');
+  localStorage.removeItem('wparContacts');
+  const WB = window.wparBlocks, WC = window.wparContacts;
+  WC.add({ name: 'Olivia Pearce', phone: '0423 118 445', email: 'olivia.p@outlook.com' });
+  WC.add({ name: 'Harry Thompson', phone: '0412 334 998', email: 'harry.thompson@gmail.com' });
+  const olivia = WC.search('olivia')[0];
+  WB.placeDirectHold('8-35', {
+    purchasers: [{ name: olivia.name, phone: olivia.phone, email: olivia.email }],
+    contactId: olivia.id, notes: 'Deposit due Mon', placedBy: 'agent-1',
+  });
+  WB.requestHold('8-44', { name: 'Random Buyer', phone: '04000', email: 'rb@e.com', source: 'ebook' });
+
+  const rec = WB.getBlock('8-35');
+  const token = rec.hold.intentionForm.token;
+  log('TOKEN=' + token);
+
+  // Helper: load a URL in the iframe and resolve after idle
+  function loadIframe(url, waitMs){
+    return new Promise(res => {
+      const f = document.getElementById('f');
+      f.onload = () => setTimeout(() => res(f.contentDocument || f.contentWindow.document), waitMs || 500);
+      f.src = url;
+    });
+  }
+
+  // ── Test the intention-form page ──
+  log('\n── Intention-form page (valid token) ──');
+  let doc = await loadIframe('wharparilla-intention-form.html?token=' + token, 400);
+  const h1 = doc.querySelector('h1')?.textContent || '';
+  assert('IF1 heading mentions "Lot 35"', /Lot\s*35/.test(h1), 'got: ' + h1);
+  const html = doc.body.innerHTML;
+  assert('IF2 purchaser Olivia Pearce rendered', html.includes('Olivia Pearce'));
+  assert('IF3 purchaser phone rendered',         html.includes('0423 118 445'));
+  assert('IF4 Sign & send button present',        !!doc.getElementById('submitBtn'));
+  assert('IF5 sig input prefilled with Olivia',   doc.getElementById('sigName')?.value === 'Olivia Pearce');
+  assert('IF6 Powered by Tenvo footer',           html.includes('Powered by') && html.includes('Tenvo'));
+  assert('IF7 3 acknowledgement checkboxes',      doc.querySelectorAll('input[data-ack]').length === 3);
+
+  // ── Simulate signing in the iframe directly ──
+  log('\n── Simulate buyer signing in iframe ──');
+  doc.querySelectorAll('input[data-ack]').forEach(c => c.checked = true);
+  doc.querySelectorAll('input[data-ack]').forEach(c => c.dispatchEvent(new Event('change')));
+  doc.getElementById('submitBtn').click();
+  await new Promise(r => setTimeout(r, 300));
+  const html2 = doc.body.innerHTML;
+  assert('SIGN1 "Thank you" screen shown',       /Thank you,\s*Olivia Pearce/.test(html2) || /Intention received/.test(html2),
+    'body still: ' + html2.slice(0,300));
+  // Verify data layer updated
+  const rec2 = WB.getBlock('8-35');
+  assert('SIGN2 record now has signedAt',        !!rec2.hold.intentionForm.signedAt);
+  assert('SIGN3 signatureName stored',           rec2.hold.intentionForm.signatureName === 'Olivia Pearce');
+
+  // ── Intention-form page with bad token ──
+  log('\n── Intention-form page (bad token) ──');
+  doc = await loadIframe('wharparilla-intention-form.html?token=nope', 300);
+  assert('BAD1 invalid state shown',             /Link isn't valid/i.test(doc.body.textContent) || /isn.t valid/.test(doc.body.textContent));
+
+  // ── Control centre renders with state ──
+  log('\n── Control centre page (with state) ──');
+  const f = document.getElementById('f');
+  f.style.height = '1000px';
+  doc = await loadIframe('wharparilla-masterplan.html', 2000);
+  const svg = doc.querySelector('.mp-image-wrap svg');
+  assert('CC1 SVG present',                       !!svg);
+  // After signing, 8-35 moved from ON_HOLD → HOLD_SIGNED (blue). Accept either.
+  const holdOrSignedPaths = doc.querySelectorAll('.fill-lot-available.is-hold, .fill-lot-available.is-signed');
+  assert('CC2 at least one hold/signed path',         holdOrSignedPaths.length >= 1, 'count=' + holdOrSignedPaths.length);
+  // Pending status should have reverted (we signed), but 8-36 is still pending
+  const pendingPaths = doc.querySelectorAll('.fill-lot-available.is-pending');
+  assert('CC3 at least one is-pending path (8-44)', pendingPaths.length >= 1, 'count=' + pendingPaths.length);
+  // Legend counter: expect hold+pending = 2
+  const legendSpans = doc.querySelectorAll('.mp-legend-overlay span b');
+  const legendText = [...legendSpans].map(b => b.textContent).join(',');
+  log('    legend numbers: ' + legendText);
+
+  // ── Ebook page renders map + reflects state ──
+  log('\n── Ebook page (buyer-facing map reflects state) ──');
+  doc = await loadIframe('wharparilla-ebook.html', 2000);
+  const ebSvg = doc.querySelector('.mp-image-wrap svg');
+  assert('EB1 SVG present in ebook',              !!ebSvg);
+  const ebHold = doc.querySelectorAll('.fill-lot-available.is-hold, .fill-lot-available.is-signed');
+  assert('EB2 ebook map reflects hold/signed state',  ebHold.length >= 1, 'count=' + ebHold.length);
+  const ebReqPanel = doc.getElementById('reqhold');
+  assert('EB3 ebook request-hold panel in DOM',   !!ebReqPanel);
+
+  // ── Tenvo Projects shell: Wharparilla detail reflects live state ──
+  log('\n── Tenvo shell (index.html → Wharparilla detail) ──');
+  doc = await loadIframe('index.html', 1200);
+  // Simulate click on the Wharparilla project card.
+  const card = doc.querySelector('[onclick*="openProject(\'wharparilla\')"]') || doc.querySelector('.proj-card');
+  assert('SH1 project card present',               !!card);
+  if (card) card.click();
+  await new Promise(r => setTimeout(r, 400));
+  const detail = doc.getElementById('view-detail');
+  assert('SH2 detail view is visible',             detail && detail.style.display !== 'none');
+  // Live activity numbers (block A hold released earlier; B held; C held → hold=2; pending=0; sent=2; signed=0 OR 1 depending on earlier signing)
+  const livePending = doc.getElementById('o-live-pending')?.textContent;
+  const liveHold    = doc.getElementById('o-live-hold')?.textContent;
+  const liveSent    = doc.getElementById('o-live-sent')?.textContent;
+  const liveSigned  = doc.getElementById('o-live-signed')?.textContent;
+  log('    live counters: pending=' + livePending + ' hold=' + liveHold + ' intentions-signed=' + liveSent + ' contract=' + liveSigned);
+  assert('SH3 hold counter is a number',           /^\d+$/.test(liveHold||''));
+  // After signing: hold=0, signed=1. Total active activity should be >= 1.
+  const totalActive = Number(livePending||0) + Number(liveHold||0) + Number(liveSent||0) + Number(liveSigned||0);
+  assert('SH4 at least 1 live hold/signed/pending', totalActive >= 1, 'total=' + totalActive);
+  // Open Sales tab and verify pipeline cards render
+  const salesTab = doc.querySelector('#main-tabs .section-tab[data-group="sales"]');
+  assert('SH5 Sales tab present',                  !!salesTab);
+  if (salesTab) salesTab.click();
+  await new Promise(r => setTimeout(r, 200));
+  const plCols = doc.querySelectorAll('#pl-cols .pl-col');
+  // Default conversion filter = Unconverted → 5 lanes (Pending hold / Hot / Warm / Cold / Lost).
+  assert('SH6 kanban defaults to 5 unconverted lanes', plCols.length === 5, 'count=' + plCols.length);
+  const columnTitles = [...plCols].map(c => c.querySelector('.pl-col-title')?.textContent?.trim()).join('|');
+  assert('SH7 unconverted lane set is correct',
+    /Pending hold/.test(columnTitles)
+    && /Hot/.test(columnTitles)
+    && /Warm/.test(columnTitles)
+    && /Cold/.test(columnTitles)
+    && /Lost/.test(columnTitles),
+    'got: ' + columnTitles);
+  // Switch to Converted — expect 5 lanes (Sent / Returned / Review / Conditional / Unconditional).
+  const convertedPill = doc.querySelector('#sub-tabs [data-conversion="converted"]');
+  if (convertedPill) { convertedPill.click(); await new Promise(r => setTimeout(r, 150)); }
+  const plColsConv = doc.querySelectorAll('#pl-cols .pl-col');
+  assert('SH7a converted filter shows 5 lanes', plColsConv.length === 5, 'count=' + plColsConv.length);
+  // Return to Unconverted for the subsequent list-view checks.
+  const unconvertedPill = doc.querySelector('#sub-tabs [data-conversion="unconverted"]');
+  if (unconvertedPill) { unconvertedPill.click(); await new Promise(r => setTimeout(r, 150)); }
+  const anyCards = doc.querySelectorAll('#pl-cols .pl-card');
+  assert('SH8 at least one pipeline card',          anyCards.length >= 1, 'count=' + anyCards.length);
+  // Switch to Buyers sub-tab
+  const buyersBtn = doc.querySelector('#sub-tabs .sub-tab[data-tab="buyers"]');
+  if (buyersBtn) { buyersBtn.click(); await new Promise(r => setTimeout(r, 200)); }
+  const listSections = doc.querySelectorAll('#panel-buyers .lv-section');
+  assert('SH9 list view shows 5 unconverted sections', listSections.length === 5, 'count=' + listSections.length);
+  const listTitles = [...listSections].map(s => s.querySelector('.lv-section-title')?.textContent?.trim()).join('|');
+  assert('SH10 list sections match unconverted lanes',
+    /Pending hold/.test(listTitles) && /Hot/.test(listTitles) && /Lost/.test(listTitles),
+    'titles: ' + listTitles);
+
+  log('\n' + (failures === 0 ? '━━ ALL UI CHECKS PASSED ━━' : '━━ ' + failures + ' UI CHECK(S) FAILED ━━'));
+  document.title = failures === 0 ? 'E2E-UI-OK' : 'E2E-UI-FAIL-' + failures;
+})();
+</script>
+</body>
+</html>

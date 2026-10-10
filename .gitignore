@@ -1,0 +1,6 @@
+.DS_Store
+.vscode/
+.idea/
+Thumbs.db
+*.swp
+node_modules/
